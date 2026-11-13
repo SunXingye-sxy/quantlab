@@ -239,7 +239,12 @@ def download_stock_daily(
     retries: int = 3,
     pause: float = 0.5,
 ) -> pd.DataFrame:
-    """下载单只股票日线行情并统一列名，东财失败自动回退新浪。
+    """下载单只股票日线行情并统一列名，新浪为主源、东财为后备。
+
+    为什么新浪优先：东财的前复权（qfq）序列在部分高分红/送转标的上
+    复权因子断裂，会产生大量超过涨跌停的"假暴跌"（实测 600039 四川路桥
+    386 天、601088 中国神华 309 天），而新浪的同标的前复权序列连续，
+    越界 0 条。这是数据源的质量问题，靠事后计算补不回来。
 
     Parameters
     ----------
@@ -255,7 +260,17 @@ def download_stock_daily(
     global _EASTMONEY_BLOCKED
     last_err: Exception | None = None
 
-    # 1) 主源：东方财富
+    # 1) 主源：新浪
+    for attempt in range(retries):
+        try:
+            df = _download_sina(code, start, end, adjust)
+            if df is not None and not df.empty:
+                return df
+        except Exception as exc:
+            last_err = exc
+            time.sleep(pause * (attempt + 1))
+
+    # 2) 备源：东方财富（新浪缺该标的或无数据时兜底）
     if not _EASTMONEY_BLOCKED:
         for attempt in range(retries):
             try:
@@ -265,19 +280,11 @@ def download_stock_daily(
                 msg = f"{type(exc).__name__} {exc}"
                 if "限流" in msg or "push2" in msg.lower() or "ProxyError" in msg:
                     _EASTMONEY_BLOCKED = True
-                    print("[提示] 东财接口被限流，本次运行自动切换到新浪数据源。")
+                    print("[提示] 东财接口被限流，跳过备用源。")
                     break
                 time.sleep(pause * (attempt + 1))
 
-    # 2) 备源：新浪
-    for attempt in range(retries):
-        try:
-            return _download_sina(code, start, end, adjust)
-        except Exception as exc:
-            last_err = exc
-            time.sleep(pause * (attempt + 1))
-
-    raise RuntimeError(f"{code} 下载失败（东财+新浪均不可用）：{last_err}")
+    raise RuntimeError(f"{code} 下载失败（新浪+东财均不可用）：{last_err}")
 
 
 def download_panel(
