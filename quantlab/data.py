@@ -101,6 +101,25 @@ def _import_akshare():
     return ak
 
 
+def _ak_fn(*names: str):
+    """按顺序返回 akshare 中第一个存在的函数，用于兼容接口改名。
+
+    akshare 的接口名随版本变化：1.20.45 把 `tool_trade_date_hist_sina` 改成
+    `calendar_trade_date_hist_sina`，1.20.46 把 `stock_zh_a_daily` 改成
+    `stock_zh_a_hist_sina`、`stock_zh_a_hist` 改成 `stock_zh_a_hist_em`。
+    代码里硬写一个名字，换台机器 pip 装的版本新一点，整个项目就跑不动。
+    """
+    ak = _import_akshare()
+    for name in names:
+        fn = getattr(ak, name, None)
+        if fn is not None:
+            return fn
+    raise AttributeError(
+        "当前 akshare 版本不含这些接口：" + " / ".join(names)
+        + "。请检查版本：pip show akshare"
+    )
+
+
 def get_index_constituents(index_code: str = "000300") -> pd.DataFrame:
     """获取指数成分股列表。
 
@@ -150,7 +169,18 @@ def get_trade_calendar(start: str = DEFAULT_START, end: str = DEFAULT_END) -> pd
     用真实交易日历而不是自然日，能避免把周末、节假日当成「数据缺失」。
     """
     ak = _import_akshare()
-    df = ak.tool_trade_date_hist_sina()
+    # akshare 1.20.45 起把 tool_trade_date_hist_sina 更名为 calendar_trade_date_hist_sina。
+    # 这里两个名字都试一次，兼容新旧版本：pandas/akshare 这类库一次 pip 升级
+    # 就可能改接口名，硬写一个名字会让整个项目在某台机器上直接跑不动。
+    cal_fn = getattr(ak, "calendar_trade_date_hist_sina", None)
+    if cal_fn is None:
+        cal_fn = getattr(ak, "tool_trade_date_hist_sina", None)
+    if cal_fn is None:
+        raise AttributeError(
+            "当前 akshare 版本没有交易日历接口，"
+            "请检查 akshare 是否安装完整：pip show akshare"
+        )
+    df = cal_fn()
     col = "trade_date" if "trade_date" in df.columns else df.columns[0]
     dates = pd.to_datetime(df[col])
     mask = (dates >= pd.to_datetime(start)) & (dates <= pd.to_datetime(end))
@@ -172,9 +202,9 @@ def _to_sina_symbol(code: str) -> str:
 
 
 def _download_eastmoney(code: str, start: str, end: str, adjust: str) -> pd.DataFrame:
-    """主数据源：东方财富（ak.stock_zh_a_hist）。"""
-    ak = _import_akshare()
-    raw = ak.stock_zh_a_hist(
+    """东财数据源（新版叫 stock_zh_a_hist_em，旧版叫 stock_zh_a_hist）。"""
+    hist_fn = _ak_fn("stock_zh_a_hist_em", "stock_zh_a_hist")
+    raw = hist_fn(
         symbol=code, period="daily", start_date=start, end_date=end, adjust=adjust
     )
     if raw is None or raw.empty:
@@ -202,12 +232,12 @@ def _download_eastmoney(code: str, start: str, end: str, adjust: str) -> pd.Data
 
 
 def _download_sina(code: str, start: str, end: str, adjust: str) -> pd.DataFrame:
-    """备用数据源：新浪（ak.stock_zh_a_daily）。
+    """新浪数据源（新版叫 stock_zh_a_hist_sina，旧版叫 stock_zh_a_daily）。
 
     与东财的差别：turnover 是小数（需乘 100），没有涨跌幅字段（需自己算）。
     """
-    ak = _import_akshare()
-    raw = ak.stock_zh_a_daily(
+    hist_fn = _ak_fn("stock_zh_a_hist_sina", "stock_zh_a_daily")
+    raw = hist_fn(
         symbol=_to_sina_symbol(code), start_date=start, end_date=end, adjust=adjust
     )
     if raw is None or raw.empty:
@@ -323,7 +353,11 @@ def download_panel(
                 continue
             _save_frame(df, cache)
             frames.append(df)
-        except Exception:
+        except Exception as exc:
+            # 把真实异常打印出来：否则只知道"失败"，不知道是接口改名、
+            # 网络代理还是返回字段对不上，排查全靠猜。
+            if verbose:
+                print(f"[失败] {code}: {type(exc).__name__}: {exc}")
             failed.append(code)
 
     if not frames:
